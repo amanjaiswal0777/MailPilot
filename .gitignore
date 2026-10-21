@@ -6,5 +6,4 @@ calendar_invites/
 important_marks.json
 __pycache__/
 .venv/
-venv/
-
+venv
