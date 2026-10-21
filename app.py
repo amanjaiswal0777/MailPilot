@@ -104,7 +104,7 @@ def start_hosted_oauth(write_mode, calendar_enabled):
     state = secrets.token_urlsafe(32)
     scopes = ga.scopes_for(write_mode, calendar_enabled)
     try:
-        url = ga.create_hosted_oauth_url(scopes, state)
+        url, code_verifier = ga.create_hosted_oauth_url(scopes, state)
     except ga.ConfigError as exc:
         st.error(str(exc))
         return
@@ -121,6 +121,7 @@ def start_hosted_oauth(write_mode, calendar_enabled):
             "scopes": scopes,
             "write_mode": write_mode,
             "calendar_enabled": calendar_enabled,
+            "code_verifier": code_verifier,
         }
     st.session_state.hosted_oauth_url = url
 
@@ -144,7 +145,9 @@ def handle_hosted_oauth_callback():
         if not request or time.time() - request["created"] >= 600:
             raise ga.ConfigError("This sign-in request expired. Click Connect to Google and try again.")
 
-        creds = ga.complete_hosted_oauth(code, state, request["scopes"])
+        creds = ga.complete_hosted_oauth(
+            code, state, request["scopes"], request["code_verifier"]
+        )
         gmail, calendar = ga.get_services_with_credentials(
             creds, calendar_enabled=request["calendar_enabled"]
         )
@@ -531,7 +534,10 @@ def main():
     if ga.hosted_oauth_enabled():
         handle_hosted_oauth_callback()
     if st.session_state.oauth_notice:
-        st.success(st.session_state.oauth_notice) if st.session_state.conn else st.error(st.session_state.oauth_notice)
+        if st.session_state.conn:
+            st.success(st.session_state.oauth_notice)
+        else:
+            st.error(st.session_state.oauth_notice)
         st.session_state.oauth_notice = None
     page = render_sidebar()
     conn = st.session_state.conn

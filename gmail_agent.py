@@ -125,12 +125,15 @@ def create_hosted_oauth_url(scopes, state):
     authorization_url, _ = flow.authorization_url(
         access_type="offline", include_granted_scopes="true", prompt="consent"
     )
-    return authorization_url
+    # PKCE's verifier must survive the trip through Google's consent screen.
+    return authorization_url, flow.code_verifier
 
 
-def complete_hosted_oauth(code, state, scopes):
+def complete_hosted_oauth(code, state, scopes, code_verifier):
     """Exchange a validated hosted OAuth callback code for user credentials."""
-    flow = Flow.from_client_config(_oauth_client_config(), scopes=scopes, state=state)
+    flow = Flow.from_client_config(
+        _oauth_client_config(), scopes=scopes, state=state, code_verifier=code_verifier
+    )
     flow.redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
     flow.fetch_token(code=code)
     return flow.credentials
