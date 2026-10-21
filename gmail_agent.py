@@ -123,7 +123,7 @@ def create_hosted_oauth_url(scopes, state):
     flow = Flow.from_client_config(config, scopes=scopes, state=state)
     flow.redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
     authorization_url, _ = flow.authorization_url(
-        access_type="offline", include_granted_scopes="true", prompt="consent"
+        access_type="offline", include_granted_scopes="false", prompt="consent"
     )
     # PKCE's verifier must survive the trip through Google's consent screen.
     return authorization_url, flow.code_verifier
