@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -41,7 +42,14 @@ from pydantic import BaseModel, Field
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
-CREDENTIALS_FILE = BASE_DIR / "credentials.json"  # from Google Cloud Console
+_credentials_path = os.getenv("GOOGLE_OAUTH_CLIENT_FILE", "").strip()
+CREDENTIALS_FILE = (
+    Path(_credentials_path).expanduser()
+    if _credentials_path
+    else Path("/etc/secrets/credentials.json")
+    if Path("/etc/secrets/credentials.json").exists()
+    else BASE_DIR / "credentials.json"
+)  # Keep OAuth client secrets out of the Git repository.
 DRAFTS_DIR = BASE_DIR / "drafts"                  # drafts are saved here (never sent)
 INVITES_DIR = BASE_DIR / "calendar_invites"       # .ics files you can import into Google Calendar
 MARKS_FILE = BASE_DIR / "important_marks.json"    # your own "important" marks (read-only mode)
@@ -81,6 +89,58 @@ def scopes_for(write_mode=False, calendar_enabled=False):
 def _token_file(scopes):
     key = hashlib.sha1(" ".join(sorted(scopes)).encode()).hexdigest()[:8]
     return BASE_DIR / f"token_{key}.json"
+
+
+def hosted_oauth_enabled():
+    return bool(os.getenv("GOOGLE_REDIRECT_URI", "").strip())
+
+
+def has_oauth_client():
+    return CREDENTIALS_FILE.is_file()
+
+
+def _oauth_client_config():
+    if not has_oauth_client():
+        raise ConfigError(
+            f"OAuth client file not found at {CREDENTIALS_FILE}. Configure "
+            "GOOGLE_OAUTH_CLIENT_FILE or add credentials.json."
+        )
+    try:
+        config = json.loads(CREDENTIALS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"Could not read the Google OAuth client file: {exc}") from exc
+    return config
+
+
+def create_hosted_oauth_url(scopes, state):
+    """Build the Google consent URL for the hosted web-server OAuth flow."""
+    config = _oauth_client_config()
+    if "web" not in config:
+        raise ConfigError(
+            "Hosted sign-in requires a Google OAuth client of type Web application. "
+            "A Desktop app client only works when running locally."
+        )
+    flow = Flow.from_client_config(config, scopes=scopes, state=state)
+    flow.redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
+    authorization_url, _ = flow.authorization_url(
+        access_type="offline", include_granted_scopes="true", prompt="consent"
+    )
+    return authorization_url
+
+
+def complete_hosted_oauth(code, state, scopes):
+    """Exchange a validated hosted OAuth callback code for user credentials."""
+    flow = Flow.from_client_config(_oauth_client_config(), scopes=scopes, state=state)
+    flow.redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
+    flow.fetch_token(code=code)
+    return flow.credentials
+
+
+def get_services_with_credentials(creds, calendar_enabled=False):
+    """Build API services from credentials held by the current Streamlit session."""
+    gmail = build("gmail", "v1", credentials=creds)
+    calendar = build("calendar", "v3", credentials=creds) if calendar_enabled else None
+    return gmail, calendar
 
 
 def token_exists(write_mode=False, calendar_enabled=False):

@@ -5,6 +5,9 @@ Run with:  streamlit run app.py
 """
 import json
 import os
+import secrets
+import threading
+import time
 
 import streamlit as st
 
@@ -41,6 +44,8 @@ def init_state():
         "agent": None,
         "chat_display": [],  # [{"role", "content", "tools"}]
         "autoconnect_tried": False,
+        "hosted_oauth_url": None,
+        "oauth_notice": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -86,6 +91,81 @@ def connect(write_mode, calendar_enabled):
     }
     reset_outputs()
     return True
+
+
+@st.cache_resource
+def _oauth_request_store():
+    # Streamlit sessions are not guaranteed to survive Google's redirect.
+    # Keep only short-lived, single-use CSRF state on the server.
+    return {"requests": {}, "lock": threading.Lock()}
+
+
+def start_hosted_oauth(write_mode, calendar_enabled):
+    state = secrets.token_urlsafe(32)
+    scopes = ga.scopes_for(write_mode, calendar_enabled)
+    try:
+        url = ga.create_hosted_oauth_url(scopes, state)
+    except ga.ConfigError as exc:
+        st.error(str(exc))
+        return
+
+    store = _oauth_request_store()
+    now = time.time()
+    with store["lock"]:
+        store["requests"] = {
+            key: value for key, value in store["requests"].items()
+            if now - value["created"] < 600
+        }
+        store["requests"][state] = {
+            "created": now,
+            "scopes": scopes,
+            "write_mode": write_mode,
+            "calendar_enabled": calendar_enabled,
+        }
+    st.session_state.hosted_oauth_url = url
+
+
+def handle_hosted_oauth_callback():
+    """Validate and finish Google's redirect before rendering the app."""
+    query = st.query_params
+    code, state, error = query.get("code"), query.get("state"), query.get("error")
+    if not (code or error):
+        return
+
+    try:
+        if error:
+            raise ga.ConfigError(f"Google sign-in was not completed: {error}")
+        if not code or not state:
+            raise ga.ConfigError("Google returned an incomplete sign-in response. Please reconnect.")
+
+        store = _oauth_request_store()
+        with store["lock"]:
+            request = store["requests"].pop(state, None)
+        if not request or time.time() - request["created"] >= 600:
+            raise ga.ConfigError("This sign-in request expired. Click Connect to Google and try again.")
+
+        creds = ga.complete_hosted_oauth(code, state, request["scopes"])
+        gmail, calendar = ga.get_services_with_credentials(
+            creds, calendar_enabled=request["calendar_enabled"]
+        )
+        email = ga.get_profile_email(gmail)
+        st.session_state.conn = {
+            "gmail": gmail,
+            "calendar": calendar,
+            "email": email,
+            "write_mode": request["write_mode"],
+            "calendar_enabled": request["calendar_enabled"],
+        }
+        st.session_state.oauth_notice = f"Connected as {email}."
+        reset_outputs()
+    except ga.ConfigError as exc:
+        st.session_state.oauth_notice = str(exc)
+    except Exception as exc:
+        st.session_state.oauth_notice = f"Google sign-in failed: {exc}"
+    finally:
+        # Remove the one-time authorization code from the visible URL.
+        query.clear()
+        st.session_state.hosted_oauth_url = None
 
 
 def get_llm():
@@ -154,8 +234,12 @@ def render_sidebar():
                 st.rerun()
         else:
             if st.button("Connect to Google", type="primary"):
-                if connect(write_mode, calendar_enabled):
+                if ga.hosted_oauth_enabled():
+                    start_hosted_oauth(write_mode, calendar_enabled)
+                elif connect(write_mode, calendar_enabled):
                     st.rerun()
+            if st.session_state.hosted_oauth_url:
+                st.link_button("Continue to Google", st.session_state.hosted_oauth_url)
             # Skip the browser step when a saved login already exists.
             if not st.session_state.autoconnect_tried:
                 st.session_state.autoconnect_tried = True
@@ -173,13 +257,15 @@ def render_welcome():
         "Connect your Google account to summarize emails, get a morning briefing, "
         "and chat with an assistant that drafts replies for you to review and send yourself."
     )
-    if not ga.CREDENTIALS_FILE.exists():
+    if not ga.has_oauth_client():
         st.warning(
-            f"`credentials.json` was not found in `{ga.BASE_DIR}`. In Google Cloud Console, enable the "
-            "Gmail API (and the Calendar API if you want calendar), create an OAuth client ID of type "
-            "Desktop app, download it and save it there as `credentials.json`."
+            f"Google OAuth client file was not found at `{ga.CREDENTIALS_FILE}`. "
+            "Add it locally or configure it as a Render Secret File."
         )
-    st.info("Click **Connect to Google** in the sidebar. The first sign-in opens a browser window.")
+    if ga.hosted_oauth_enabled():
+        st.info("Click **Connect to Google** in the sidebar, then approve access in Google.")
+    else:
+        st.info("Click **Connect to Google** in the sidebar. The first sign-in opens a browser window.")
 
 
 def summaries_to_text(items):
@@ -442,6 +528,11 @@ def render_drafts():
 # --------------------------------------------------------------------------
 def main():
     init_state()
+    if ga.hosted_oauth_enabled():
+        handle_hosted_oauth_callback()
+    if st.session_state.oauth_notice:
+        st.success(st.session_state.oauth_notice) if st.session_state.conn else st.error(st.session_state.oauth_notice)
+        st.session_state.oauth_notice = None
     page = render_sidebar()
     conn = st.session_state.conn
 
