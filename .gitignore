@@ -1,0 +1,10 @@
+.env
+credentials.json
+token_*.json
+drafts/
+calendar_invites/
+important_marks.json
+__pycache__/
+.venv/
+venv/
+

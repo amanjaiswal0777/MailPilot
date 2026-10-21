@@ -1,0 +1,8 @@
+streamlit>=1.40
+python-dotenv
+google-auth
+google-auth-oauthlib
+google-api-python-client
+langchain-core
+langchain-openai
+pydantic>=2
