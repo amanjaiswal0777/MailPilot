@@ -262,13 +262,21 @@ def render_sidebar():
                 reset_outputs()
                 st.rerun()
         else:
-            if st.button("Connect to Google", type="primary"):
-                if ga.hosted_oauth_enabled():
+            if ga.hosted_oauth_enabled():
+                # Prepare the OAuth URL before rendering the control so one click
+                # on Connect to Google goes directly to Google's consent page.
+                if not st.session_state.hosted_oauth_url:
                     start_hosted_oauth()
-                elif connect():
+                if st.session_state.hosted_oauth_url:
+                    st.link_button(
+                        "Connect to Google",
+                        st.session_state.hosted_oauth_url,
+                        type="primary",
+                        use_container_width=True,
+                    )
+            elif st.button("Connect to Google", type="primary"):
+                if connect():
                     st.rerun()
-            if st.session_state.hosted_oauth_url:
-                st.link_button("Continue to Google", st.session_state.hosted_oauth_url)
             # Reuse a saved token only for local runs. Hosted sign-in must use
             # the web OAuth redirect flow and stay within the current session.
             if not st.session_state.autoconnect_tried:
