@@ -14,10 +14,55 @@ import streamlit as st
 
 import gmail_agent as ga
 
-st.set_page_config(page_title="Gmail AI Agent", page_icon="📧", layout="wide")
+st.set_page_config(page_title="Gmail Pilot", page_icon="📧", layout="wide")
 
-PAGES = ["📬 Summary", "🌅 Briefing", "💬 Chat", "📝 Drafts"]
+# PAGES = ["📬 Summary", "🌅 Briefing", "💬 Chat", "📝 Drafts"]
+PAGES = ["Summary", "Briefing", "Chat", "Drafts"]
+PAGE_ICONS = {
+    "Summary": ":material/mail:",
+    "Briefing": ":material/wb_sunny:",
+    "Chat": ":material/chat_bubble:",
+    "Drafts": ":material/edit_note:",
+}
 
+NAV_CSS = """
+<style>
+section[data-testid="stSidebar"] { background: #6b6b6b; }
+
+.st-key-nav { gap: 0.3rem; }
+.st-key-nav [data-testid="stButton"] { width: 100%; }
+
+/* inactive item */
+.st-key-nav button {
+    width: 100%;
+    padding: 0.6rem 0.9rem;
+    border: none !important;
+    border-radius: 12px;
+    background: transparent;
+    box-shadow: none;
+    color: #F5F5F3;
+    font-weight: 500;
+    outline: none !important;
+}
+.st-key-nav button > div { justify-content: flex-start; gap: 0.6rem; }
+.st-key-nav button p { font-size: 1rem; }
+.st-key-nav button:hover { background: rgba(0, 0, 0, 0.05); color: #111; }
+
+/* active item (white pill) */
+.st-key-nav button[kind="primary"],
+.st-key-nav button[data-testid="stBaseButton-primary"] {
+    background: #ffffff;
+    color: #111111;
+    font-weight: 700;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+.st-key-nav button[kind="primary"]:hover,
+.st-key-nav button[data-testid="stBaseButton-primary"]:hover {
+    background: #ffffff;
+    color: #111111;
+}
+</style>
+"""
 CATEGORY_LABEL = {
     "urgent": "🔴 Urgent",
     "needs_reply": "🟠 Needs reply",
@@ -40,6 +85,7 @@ EXAMPLE_PROMPTS = [
 def init_state():
     defaults = {
         "conn": None,  # dict: gmail, email
+        "page": PAGES[0],  
         "summaries": None,
         "briefing": None,
         "agent": None,
@@ -173,10 +219,11 @@ def get_llm():
 # --------------------------------------------------------------------------
 def render_sidebar():
     with st.sidebar:
-        st.title("📧 Gmail AI Agent")
+        st.markdown(NAV_CSS, unsafe_allow_html=True)
+        st.title("Gmail Pilot")
         st.caption("Reads and summarizes your mail and writes drafts. It can never send.")
 
-        page = st.radio("Page", PAGES, label_visibility="collapsed")
+        page = render_nav()
         st.divider()
 
         conn = st.session_state.conn
@@ -234,6 +281,23 @@ def render_sidebar():
 # --------------------------------------------------------------------------
 # Pages
 # --------------------------------------------------------------------------
+def _set_page(name):
+    st.session_state.page = name
+
+
+def render_nav():
+    with st.container(key="nav"):  # key gives the CSS a hook: .st-key-nav
+        for name in PAGES:
+            st.button(
+                name,
+                icon=PAGE_ICONS[name],
+                key=f"nav_{name}",
+                type="primary" if st.session_state.page == name else "secondary",
+                on_click=_set_page,
+                args=(name,),
+            )
+    return st.session_state.page
+
 def render_welcome():
     st.header("Your inbox, summarized")
     st.write(
