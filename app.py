@@ -5,6 +5,7 @@ Run with:  streamlit run app.py
 """
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -379,7 +380,28 @@ def _format_tool_call(name, args):
     return f"`{name}` {json.dumps(args, ensure_ascii=False)}"
 
 
-def _capture_recipient_suggestions(name, args, result):
+_EMAIL_ADDRESS_PATTERN = re.compile(
+    r"(?i)(?<![\w.+-])[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?"
+    r"(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+"
+)
+
+
+def _prompt_recipient_email(prompt):
+    """Return a syntactically valid email address explicitly present in the prompt."""
+    for match in _EMAIL_ADDRESS_PATTERN.finditer(prompt or ""):
+        address = match.group(0).rstrip(".,;:!?)]}")
+        try:
+            return ga._validated_recipient(address)
+        except ValueError:
+            continue
+    return None
+
+
+def _capture_recipient_suggestions(name, args, result, provided_email=None):
+    # The user's explicit address takes precedence over any model-generated lookup.
+    if provided_email:
+        return
     if name != "find_recipient_email_suggestions" or "<untrusted_email_data>" not in result:
         return
     try:
@@ -489,11 +511,31 @@ def render_chat(conn):
                     get_llm(),
                     user_name=st.session_state.user_name,
                 )
-            answer = st.session_state.agent.ask(
-                prompt,
-                on_tool_call=on_tool_call,
-                on_tool_result=_capture_recipient_suggestions,
+            provided_email = _prompt_recipient_email(prompt)
+            agent_prompt = prompt
+            if provided_email:
+                agent_prompt += (
+                    f"\n\nThe complete recipient email address explicitly provided in this request is "
+                    f"{provided_email}. Use it exactly. Do not look up suggestions or ask me to choose."
+                )
+            on_tool_result = lambda name, args, result: _capture_recipient_suggestions(
+                name, args, result, provided_email
             )
+            answer = st.session_state.agent.ask(
+                agent_prompt,
+                on_tool_call=on_tool_call,
+                on_tool_result=on_tool_result,
+            )
+            if provided_email and answer.strip() == "[RECIPIENT_CHOICES]":
+                answer = st.session_state.agent.ask(
+                    f"You already have the valid recipient address {provided_email} from the user's "
+                    "request. Do not show or request recipient choices. Continue the requested task and "
+                    "save the draft using that exact address.",
+                    on_tool_call=on_tool_call,
+                    on_tool_result=on_tool_result,
+                )
+                if answer.strip() == "[RECIPIENT_CHOICES]":
+                    answer = f"I’ll use the recipient address you provided: {provided_email}."
             if st.session_state.pending_recipient_choice:
                 answer = "[RECIPIENT_CHOICES]"
             status.update(label="Done", state="complete", expanded=False)
