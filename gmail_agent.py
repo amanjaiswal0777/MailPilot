@@ -1,14 +1,12 @@
 """
 Gmail AI agent core (cannot send mail).
 
-This module holds all the logic: Google OAuth, Gmail/Calendar helpers, the
+This module holds all the logic: Google OAuth, Gmail helpers, the
 summary chain, the morning briefing and the tool-calling agent. It has no
 printing and no sys.exit, so the Streamlit app (app.py) can call it directly.
 
-Default mode is read-only. With write_mode=True the app also saves drafts into
-Gmail's Drafts folder and sets Gmail's real "Important" flag. Google has no
-"drafts only" permission: any scope that can create drafts or change labels can
-also technically send. The code never calls send.
+The app saves drafts into Gmail's Drafts folder and sets Gmail's real "Important" flag. Google has no
+"drafts only" permission: this scope could technically send mail. The code never calls send.
 """
 import base64
 import hashlib
@@ -16,10 +14,11 @@ import html
 import json
 import os
 import re
-import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from email.headerregistry import Address
 from email.message import EmailMessage
+from email.utils import getaddresses
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional
 
@@ -50,14 +49,10 @@ CREDENTIALS_FILE = (
     if Path("/etc/secrets/credentials.json").exists()
     else BASE_DIR / "credentials.json"
 )  # Keep OAuth client secrets out of the Git repository.
-DRAFTS_DIR = BASE_DIR / "drafts"                  # drafts are saved here (never sent)
-INVITES_DIR = BASE_DIR / "calendar_invites"       # .ics files you can import into Google Calendar
-MARKS_FILE = BASE_DIR / "important_marks.json"    # your own "important" marks (read-only mode)
+DRAFTS_DIR = BASE_DIR / "drafts"                  # local draft copies (never sent)
+MARKS_FILE = BASE_DIR / "important_marks.json"    # local copy of important marks
 
-# Default = read-only. No scope here can send, delete or modify anything.
-GMAIL_READONLY = "https://www.googleapis.com/auth/gmail.readonly"
-CALENDAR_READONLY = "https://www.googleapis.com/auth/calendar.readonly"
-# Only used in write mode (can create drafts and change labels; technically can also send).
+# Gmail modify lets the app save drafts and set Important; it could technically send mail.
 GMAIL_MODIFY = "https://www.googleapis.com/auth/gmail.modify"
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -79,11 +74,8 @@ class ConfigError(Exception):
 # --------------------------------------------------------------------------
 # 1. OAuth setup
 # --------------------------------------------------------------------------
-def scopes_for(write_mode=False, calendar_enabled=False):
-    scopes = [GMAIL_MODIFY if write_mode else GMAIL_READONLY]
-    if calendar_enabled:
-        scopes.append(CALENDAR_READONLY)
-    return scopes
+def scopes_for():
+    return [GMAIL_MODIFY]
 
 
 def _token_file(scopes):
@@ -139,20 +131,19 @@ def complete_hosted_oauth(code, state, scopes, code_verifier):
     return flow.credentials
 
 
-def get_services_with_credentials(creds, calendar_enabled=False):
-    """Build API services from credentials held by the current Streamlit session."""
-    gmail = build("gmail", "v1", credentials=creds)
-    calendar = build("calendar", "v3", credentials=creds) if calendar_enabled else None
-    return gmail, calendar
+def get_services_with_credentials(creds):
+    """Build the Gmail API service from credentials held by the current Streamlit session."""
+    return build("gmail", "v1", credentials=creds)
 
 
-def token_exists(write_mode=False, calendar_enabled=False):
+def token_exists():
     """True if a saved login exists for this permission set (so no browser is needed)."""
-    return _token_file(scopes_for(write_mode, calendar_enabled)).exists()
+    return _token_file(scopes_for()).exists()
 
 
-def get_credentials(scopes):
+def get_credentials(scopes=None):
     """Log in with OAuth (browser opens on first run). One token file per scope set."""
+    scopes = scopes or scopes_for()
     token_file = _token_file(scopes)
     creds = None
 
@@ -182,12 +173,10 @@ def get_credentials(scopes):
     return creds
 
 
-def get_services(write_mode=False, calendar_enabled=False):
-    """Return (gmail_service, calendar_service_or_None)."""
-    creds = get_credentials(scopes_for(write_mode, calendar_enabled))
-    gmail = build("gmail", "v1", credentials=creds)
-    calendar = build("calendar", "v3", credentials=creds) if calendar_enabled else None
-    return gmail, calendar
+def get_services():
+    """Return a Gmail API service with permission to save drafts and mark mail important."""
+    creds = get_credentials(scopes_for())
+    return build("gmail", "v1", credentials=creds)
 
 
 def get_profile_email(gmail):
@@ -289,6 +278,49 @@ def search_emails(service, query="", sender="", recipient="", unread_only=False,
     return [_metadata(service, mid) for mid in _list_ids(service, q, _clamp(max_results, 1, 25))]
 
 
+def find_recipient_email_suggestions(service, name):
+    """Return an explicitly unverified Gmail guess and matching addresses found in Gmail headers."""
+    name = " ".join(str(name or "").split()).strip()
+    if not name:
+        return {"name": "", "suggested_email": None, "found_in_gmail": []}
+
+    name_key = re.sub(r"[^a-z0-9]+", " ", name.casefold()).strip()
+    first_name = re.sub(r"[^a-z0-9]", "", name.casefold().split()[0])
+    guessed = f"{first_name}@gmail.com" if first_name else None
+    query = f'"{_q(name)}"'
+    matches = {}
+    for message in search_emails(service, query=query, max_results=50):
+        for header_name in ("from", "to"):
+            for display_name, address in getaddresses([message.get(header_name, "")]):
+                address = address.strip()
+                if not address:
+                    continue
+                display_key = re.sub(r"[^a-z0-9]+", " ", display_name.casefold()).strip()
+                local_key = re.sub(r"[^a-z0-9]+", " ", address.split("@", 1)[0].casefold()).split()
+                name_tokens = name_key.split()
+                display_tokens = display_key.split()
+                name_in_display = bool(name_tokens) and all(
+                    token in display_tokens for token in name_tokens
+                )
+                if not name_in_display and first_name not in local_key:
+                    continue
+                try:
+                    address = _validated_recipient(address)
+                except ValueError:
+                    continue
+                exact = name_key == display_key
+                item = matches.setdefault(address.casefold(), {
+                    "email": address,
+                    "display_name": display_name or "",
+                    "source": "Found in Gmail",
+                    "exact_name_match": exact,
+                })
+                item["exact_name_match"] = item["exact_name_match"] or exact
+
+    found = sorted(matches.values(), key=lambda item: (not item["exact_name_match"], item["email"]))
+    return {"name": name, "suggested_email": guessed, "found_in_gmail": found[:5]}
+
+
 def read_email(service, message_id):
     """Fetch one email and extract its readable content."""
     msg = service.users().messages().get(userId="me", id=message_id, format="full").execute()
@@ -340,9 +372,9 @@ def list_important(service, unread_only=True, max_results=10):
     return results
 
 
-def mark_important(service, message_id, important=True, write_mode=False):
+def mark_important(service, message_id, important=True):
     """Mark/unmark an email as important.
-    Always stored in important_marks.json. In write mode it also sets Gmail's own flag."""
+    Always stored in important_marks.json and changed in Gmail."""
     meta = _metadata(service, message_id)  # also validates the id
     marks = _load_marks()
     if important:
@@ -351,16 +383,13 @@ def mark_important(service, message_id, important=True, write_mode=False):
         marks.pop(message_id, None)
     MARKS_FILE.write_text(json.dumps(marks, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    gmail_flag = False
-    if write_mode:
-        body = {"addLabelIds": ["IMPORTANT"]} if important else {"removeLabelIds": ["IMPORTANT"]}
-        service.users().messages().modify(userId="me", id=message_id, body=body).execute()
-        gmail_flag = True
+    body = {"addLabelIds": ["IMPORTANT"]} if important else {"removeLabelIds": ["IMPORTANT"]}
+    service.users().messages().modify(userId="me", id=message_id, body=body).execute()
     return {
         "subject": meta["subject"],
         "important": important,
         "saved_locally": True,
-        "gmail_flag_changed": gmail_flag,
+        "gmail_flag_changed": True,
     }
 
 
@@ -416,8 +445,8 @@ def find_followups(service, mode="awaiting_their_reply", days=7, max_results=10)
 
 
 # ---- drafts (NEVER sent) ----------------------------------------------------
-def save_draft(service, to, subject, body, reply_to_message_id="", write_mode=False):
-    """Create a draft. It is saved to ./drafts (.eml + .txt) and, in write mode, to Gmail Drafts."""
+def save_draft(service, to, subject, body, reply_to_message_id=""):
+    """Save a draft locally and in Gmail Drafts. Never sends it."""
     msg = EmailMessage()
     thread_id = None
 
@@ -445,6 +474,7 @@ def save_draft(service, to, subject, body, reply_to_message_id="", write_mode=Fa
             msg["References"] = f"{_header(h, 'References')} {orig_mid}".strip()
         thread_id = orig.get("threadId")
 
+    to = _validated_recipient(to)
     subject = " ".join(str(subject).split())
     msg["To"] = to
     msg["Subject"] = subject
@@ -460,18 +490,38 @@ def save_draft(service, to, subject, body, reply_to_message_id="", write_mode=Fa
 
     result = {
         "status": "DRAFT saved - NOT sent",
+        "storage": "local file only; no Gmail draft was created",
         "to": to,
         "subject": subject,
         "saved_to": str(txt_path),
         "gmail_draft_id": None,
     }
-    if write_mode:
-        payload = {"message": {"raw": base64.urlsafe_b64encode(bytes(msg)).decode()}}
-        if thread_id:
-            payload["message"]["threadId"] = thread_id
-        d = service.users().drafts().create(userId="me", body=payload).execute()
-        result["gmail_draft_id"] = d["id"]
+    payload = {"message": {"raw": base64.urlsafe_b64encode(bytes(msg)).decode()}}
+    if thread_id:
+        payload["message"]["threadId"] = thread_id
+    d = service.users().drafts().create(userId="me", body=payload).execute()
+    result["gmail_draft_id"] = d["id"]
+    result["storage"] = "local file and Gmail Drafts"
     return result
+
+
+def _validated_recipient(value):
+    """Require exactly one well-formed address; never treat a name as an address."""
+    parsed = getaddresses([str(value or "")])
+    if len(parsed) != 1 or not parsed[0][1]:
+        raise ValueError(
+            "Recipient email address is missing or invalid. Ask the user for the full email address; "
+            "do not guess or save the draft yet."
+        )
+    address = parsed[0][1].strip()
+    try:
+        Address(addr_spec=address)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "Recipient email address is missing or invalid. Ask the user for the full email address; "
+            "do not guess or save the draft yet."
+        ) from None
+    return address
 
 
 def list_saved_drafts():
@@ -496,107 +546,6 @@ def list_saved_drafts():
             }
         )
     return drafts
-
-
-# ---- calendar ---------------------------------------------------------------
-def list_calendar_events(calendar, days_ahead=7):
-    days_ahead = _clamp(days_ahead, 1, 30)
-    now = datetime.now(timezone.utc)
-    resp = (
-        calendar.events()
-        .list(
-            calendarId="primary",
-            timeMin=now.isoformat(),
-            timeMax=(now + timedelta(days=days_ahead)).isoformat(),
-            singleEvents=True,
-            orderBy="startTime",
-            maxResults=25,
-        )
-        .execute()
-    )
-    return [
-        {
-            "title": e.get("summary", "(no title)"),
-            "start": e["start"].get("dateTime", e["start"].get("date")),
-            "end": e["end"].get("dateTime", e["end"].get("date")),
-            "location": e.get("location", ""),
-        }
-        for e in resp.get("items", [])
-    ]
-
-
-def list_todays_calendar_events(calendar):
-    """List today's primary-calendar events in the computer's local timezone."""
-    local_now = datetime.now().astimezone()
-    local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    local_end = local_start + timedelta(days=1)
-    resp = (
-        calendar.events()
-        .list(
-            calendarId="primary",
-            timeMin=local_start.astimezone(timezone.utc).isoformat(),
-            timeMax=local_end.astimezone(timezone.utc).isoformat(),
-            singleEvents=True,
-            orderBy="startTime",
-            maxResults=100,
-        )
-        .execute()
-    )
-    return [
-        {
-            "title": e.get("summary", "(no title)"),
-            "start": e["start"].get("dateTime", e["start"].get("date")),
-            "location": e.get("location", ""),
-        }
-        for e in resp.get("items", [])
-    ]
-
-
-def create_call_invite_file(title, start, duration_minutes=30, description=""):
-    """Create an .ics file. Import it into Google Calendar yourself.
-    Nothing is written to your calendar and no invitations are sent."""
-    dt = datetime.fromisoformat(start)
-    if dt.tzinfo is None:
-        dt = dt.astimezone()  # naive time = your computer's local time zone
-    start_utc = dt.astimezone(timezone.utc)
-    end_utc = start_utc + timedelta(minutes=_clamp(duration_minutes, 5, 480))
-
-    def esc(s):
-        return (
-            str(s).replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
-            .replace("\r", "").replace("\n", "\\n")
-        )
-
-    fmt = "%Y%m%dT%H%M%SZ"
-    lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//Gmail AI Agent//EN",
-        "BEGIN:VEVENT",
-        f"UID:{uuid.uuid4()}@gmail-ai-agent",
-        f"DTSTAMP:{datetime.now(timezone.utc):{fmt}}",
-        f"DTSTART:{start_utc:{fmt}}",
-        f"DTEND:{end_utc:{fmt}}",
-        f"SUMMARY:{esc(title)}",
-        f"DESCRIPTION:{esc(description)}",
-        "END:VEVENT",
-        "END:VCALENDAR",
-    ]
-    INVITES_DIR.mkdir(exist_ok=True)
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", title)[:40].strip("_") or "event"
-    path = INVITES_DIR / f"{datetime.now():%Y-%m-%d_%H%M%S}_{slug}.ics"
-    path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
-    return {"status": "Invite file created (not added to calendar, nobody invited)", "saved_to": str(path)}
-
-
-def list_saved_invites():
-    """Invite files previously saved to ./calendar_invites, newest first."""
-    if not INVITES_DIR.exists():
-        return []
-    return [
-        {"name": p.name, "text": p.read_text(encoding="utf-8", errors="replace"), "path": p}
-        for p in sorted(INVITES_DIR.glob("*.ics"), reverse=True)
-    ]
 
 
 # --------------------------------------------------------------------------
@@ -710,12 +659,8 @@ def _event_time(start):
     return "All day"
 
 
-def generate_briefing(service, calendar, llm, max_results=25):
-    """Build the morning briefing as data. Never writes files or drafts.
-
-    Returns a dict with: generated_at, pending, problems, important, unanswered,
-    events (None when calendar access is off), calendar_error.
-    """
+def generate_briefing(service, llm, max_results=25):
+    """Build an email-only morning briefing. Never writes files or drafts."""
     max_results = _clamp(max_results, 1, 25)
 
     # 1. Mails waiting for the user's reply, judged from the full body.
@@ -755,25 +700,12 @@ def generate_briefing(service, calendar, llm, max_results=25):
         reverse=True,
     )
 
-    # 4. Today's calendar (optional).
-    events, calendar_error = None, ""
-    if calendar is not None:
-        try:
-            events = [
-                {"time": _event_time(e["start"]), "title": e["title"], "location": e["location"]}
-                for e in list_todays_calendar_events(calendar)
-            ]
-        except Exception as exc:
-            calendar_error = f"{type(exc).__name__}: {exc}"
-
     return {
         "generated_at": datetime.now().astimezone(),
         "pending": pending,
         "problems": problems,
         "important": important,
         "unanswered": unanswered,
-        "events": events,
-        "calendar_error": calendar_error,
     }
 
 
@@ -788,7 +720,7 @@ def _wrap(fn):
         return f"Tool error: {e}"
 
 
-def build_tools(service, calendar=None, write_mode=False):
+def build_tools(service):
     @tool("search_emails")
     def search_emails_tool(
         sender: str = "",
@@ -835,7 +767,20 @@ def build_tools(service, calendar=None, write_mode=False):
             message_id: Gmail message ID.
             important: True to mark, False to unmark.
         """
-        return _wrap(lambda: mark_important(service, message_id, important, write_mode))
+        return _wrap(lambda: mark_important(service, message_id, important))
+
+    @tool("find_recipient_email_suggestions")
+    def find_recipient_email_suggestions_tool(name: str) -> str:
+        """Find possible recipient addresses when a user names someone without giving an email.
+
+        Returns a clearly unverified first-name@gmail.com guess and addresses matched from Gmail
+        message headers. This only suggests options; never save a draft until the user chooses or
+        provides a complete recipient address.
+
+        Args:
+            name: The person's name as given by the user.
+        """
+        return _wrap(lambda: find_recipient_email_suggestions(service, name))
 
     @tool("find_followups")
     def find_followups_tool(
@@ -863,67 +808,27 @@ def build_tools(service, calendar=None, write_mode=False):
             body: Plain-text body of the draft.
             reply_to_message_id: Gmail message ID of the mail you are replying to. ALWAYS set this for replies.
         """
-        return _wrap(lambda: save_draft(service, to, subject, body, reply_to_message_id, write_mode))
-
-    @tool("create_call_invite_file")
-    def create_call_invite_file_tool(title: str, start: str, duration_minutes: int = 30, description: str = "") -> str:
-        """Prepare a calendar event (e.g. a call) as an .ics file the user can import into Google Calendar.
-        Adds nothing to the calendar and invites nobody.
-
-        Args:
-            title: Event title, e.g. "Call with Arpit".
-            start: Start time in ISO format, e.g. 2026-10-12T15:00 (local time unless a UTC offset is given).
-            duration_minutes: Length in minutes.
-            description: Optional notes.
-        """
-        return _wrap(lambda: create_call_invite_file(title, start, duration_minutes, description))
+        return _wrap(lambda: save_draft(service, to, subject, body, reply_to_message_id))
 
     tools = [
         search_emails_tool,
         read_email_tool,
         list_important_tool,
         mark_important_tool,
+        find_recipient_email_suggestions_tool,
         find_followups_tool,
         save_draft_tool,
-        create_call_invite_file_tool,
     ]
-
-    if calendar is not None:
-
-        @tool("list_calendar_events")
-        def list_calendar_events_tool(days_ahead: int = 7) -> str:
-            """List upcoming events from the user's primary Google Calendar (read-only).
-
-            Args:
-                days_ahead: How many days ahead to look (1-30).
-            """
-            return _wrap(lambda: list_calendar_events(calendar, days_ahead))
-
-        tools.append(list_calendar_events_tool)
 
     return tools
 
 
 # ---- System prompt -----------------------------------------------------------
-def build_system_prompt(calendar_enabled, write_mode, user_name=""):
+def build_system_prompt(user_name=""):
     now = datetime.now().astimezone().strftime("%A, %d %B %Y, %H:%M %Z")
     user_name = (user_name or "").strip()
     who = user_name or "the user"
     signoff = user_name or "[Your name]"
-
-    storage = (
-        "Drafts are saved to the local drafts folder AND to the Gmail Drafts folder. "
-        "mark_important sets Gmail's Important flag and also saves a local mark."
-        if write_mode
-        else "Drafts are saved to the local drafts folder only (not in Gmail). "
-        "mark_important saves a local mark only (Gmail itself is read-only)."
-    )
-    calendar_line = (
-        "- list_calendar_events: read the user's upcoming calendar events (read-only). Use it to check "
-        "availability before proposing a call time.\n"
-        if calendar_enabled
-        else ""
-    )
 
     return (
         f"You are a careful personal email assistant for {who}. Current date and time: {now}.\n\n"
@@ -933,16 +838,16 @@ def build_system_prompt(calendar_enabled, write_mode, user_name=""):
         "- You CANNOT send, forward, delete or archive mail. There is no send tool. NEVER say or imply that a "
         "mail was sent. After drafting always say: the draft is saved and NOT sent; the user reviews and "
         "sends it themselves.\n"
-        f"- {storage}\n\n"
+        "- Drafts are saved to the local drafts folder and to Gmail Drafts. Gmail's Important flag is also updated.\n\n"
         "## Tools\n"
         "- search_emails: find mail. Use sender= for 'mail from X', recipient= for 'mail I sent to X'.\n"
         "- read_email: get the full body (needed before summarizing or replying; snippets are not enough).\n"
         "- list_important_emails / mark_important: important mail.\n"
+        "- find_recipient_email_suggestions: for a new email when the user gave a person's name but no "
+        "email address, return an unverified guess and any matching addresses seen in Gmail headers.\n"
         "- find_followups: awaiting_their_reply = mails the user sent with no answer yet; "
         "awaiting_my_reply = mails the user still has to answer.\n"
         "- save_draft: write a draft. For replies ALWAYS pass reply_to_message_id.\n"
-        "- create_call_invite_file: prepare a calendar event as an .ics file (adds nothing to the calendar).\n"
-        f"{calendar_line}\n"
         "## How to handle orders\n"
         "The user may chain several steps in one sentence. Do them in order and finish all of them. Example: "
         "'search mail from arpit and generate summary for that mail and draft a reply' means: "
@@ -950,10 +855,12 @@ def build_system_prompt(calendar_enabled, write_mode, user_name=""):
         "4) save_draft with reply_to_message_id; 5) show the draft.\n"
         "- 'the mail', 'latest mail' or 'mail from X' without a number means the single most recent match "
         "(max_results=1). If other different people also match the name, mention it in one line.\n"
-        "- Do not ask clarifying questions unless you truly cannot continue. Make a reasonable assumption and "
-        "state it in one line.\n"
-        "- Only call mark_important or create_call_invite_file when the user asks for it.\n"
-        "- If nothing is found, say so. Never invent emails, senders, dates or content. If a tool fails, "
+        "- Do not ask clarifying questions unless you truly cannot continue. Recipient address selection is "
+        "required as described below; do not assume an address.\n"
+        "- Only call mark_important when the user asks for it.\n"
+        "- If nothing is found, say so. Never invent emails, senders, dates or content; the explicitly "
+        "unverified address from find_recipient_email_suggestions is the only exception and must be labeled "
+        "as a guess. If a tool fails, "
         "report the error.\n\n"
         "## Summaries\n"
         "Before summarizing or deciding whether an email needs action, call read_email and inspect its full "
@@ -967,6 +874,15 @@ def build_system_prompt(calendar_enabled, write_mode, user_name=""):
         "good' does not require a reply by itself. If there is no clear request or outstanding obligation, "
         "print 'Action needed: No action needed.'\n\n"
         "## Drafting replies\n"
+        "- For a new email, never use a person's name as the To address. If the user provides a complete "
+        "email address, use it. If they provide only a name or the address is missing/invalid, call "
+        "find_recipient_email_suggestions(name) and do not call save_draft yet. Present the first-name@gmail.com "
+        "guess as an UNVERIFIED suggestion, plus a matching address found in the user's Gmail headers if one "
+        "exists; label it 'Found in your Gmail' and show any display name. Never list these choices in chat "
+        "or ask the user to choose in prose: the app displays a recipient selector. After calling the lookup "
+        "tool, respond with exactly [RECIPIENT_CHOICES] and no other text. Do not draft or save until the app "
+        "sends the user's selected or typed email address in a follow-up message. A Gmail header match is not "
+        "proof that the mailbox is currently valid or belongs to the intended person.\n"
         "- Read the original email first and answer exactly what it asks.\n"
         "- Write in the language and tone of the original email (formal stays formal), unless the user says "
         "otherwise. Keep it short and clear.\n"
@@ -975,6 +891,8 @@ def build_system_prompt(calendar_enabled, write_mode, user_name=""):
         "use a clear placeholder like [confirm date].\n"
         f"- Start with a greeting and end with a sign-off using the name: {signoff}.\n"
         "- After saving, show the full draft (To, Subject, body) and the file path returned by the tool.\n\n"
+        "- Confirm Gmail storage only when the save_draft result contains a Gmail draft ID. Report tool errors "
+        "clearly and never say a draft was saved in Gmail after an error.\n\n"
         "## Follow-ups and important mail\n"
         "- For a request to find mail pending, awaiting your reply, or needing your attention, use "
         "find_followups(mode='awaiting_my_reply') to find candidate threads. For EACH candidate, call "
@@ -1019,18 +937,23 @@ class Agent:
     tool_map: dict
     messages: list
 
-    def ask(self, question: str, on_tool_call: Optional[Callable[[str, dict], None]] = None) -> str:
+    def ask(
+        self,
+        question: str,
+        on_tool_call: Optional[Callable[[str, dict], None]] = None,
+        on_tool_result: Optional[Callable[[str, dict, str], None]] = None,
+    ) -> str:
         """Send one user message and run the tool loop until the model gives a final answer.
         If anything fails, the history is rolled back so the next question still works."""
         checkpoint = len(self.messages)
         self.messages.append(HumanMessage(content=question))
         try:
-            return self._loop(on_tool_call)
+            return self._loop(on_tool_call, on_tool_result)
         except Exception:
             del self.messages[checkpoint:]
             raise
 
-    def _loop(self, on_tool_call):
+    def _loop(self, on_tool_call, on_tool_result=None):
         for _ in range(MAX_AGENT_STEPS):
             ai = self.llm.invoke(self.messages)
             self.messages.append(ai)
@@ -1047,11 +970,13 @@ class Agent:
                         result = tool_fn.invoke(call["args"])
                     except Exception as exc:
                         result = f"Tool error: {exc}"
+                if on_tool_result:
+                    on_tool_result(call["name"], call["args"], result)
                 self.messages.append(ToolMessage(content=result, tool_call_id=call["id"]))
         return "Stopped: reached the maximum number of agent steps."
 
 
-def build_agent(service, llm, calendar=None, write_mode=False, user_name=""):
-    tools = build_tools(service, calendar, write_mode)
-    messages = [SystemMessage(content=build_system_prompt(calendar is not None, write_mode, user_name))]
+def build_agent(service, llm, user_name=""):
+    tools = build_tools(service)
+    messages = [SystemMessage(content=build_system_prompt(user_name))]
     return Agent(llm=llm.bind_tools(tools), tool_map={t.name: t for t in tools}, messages=messages)

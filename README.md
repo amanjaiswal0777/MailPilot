@@ -5,7 +5,7 @@ assistant that drafts replies. **It never sends mail**: drafts are saved for you
 
 ## Setup
 
-1. **Google Cloud**: create a project, enable the **Gmail API** (and the **Calendar API** if you want calendar),
+1. **Google Cloud**: create a project and enable the **Gmail API**,
    create an OAuth client ID, and add your Google account as a test user while the consent screen is in "Testing".
    For a local run, choose **Desktop app** and save the download here as `credentials.json`. For Render, use a
    separate **Web application** OAuth client; see the hosted setup below.
@@ -46,20 +46,18 @@ login keeps its access token in the current app session, so you may need to conn
 | Summary | `summary --query ... --max N` |
 | Briefing | `briefing` |
 | Chat | `ask ...` and `chat` (keeps context; use **New chat** to reset) |
-| Drafts and invites | Browse and download saved `.eml`, `.txt` and `.ics` files |
+| Drafts | Browse and download saved `.eml` and `.txt` files |
 
 ## Permissions
 
-- Default is **read-only** (`gmail.readonly`). Drafts go to the local `drafts/` folder, "important" marks to `important_marks.json`.
-- The sidebar toggle **Save drafts to Gmail and set the Important flag** switches to `gmail.modify`. Google has no
+- The app requests `gmail.modify` so it can save drafts in Gmail and set the Important flag. Google has no
   drafts-only scope, so that permission could technically send mail. The code never calls send.
-- **Read my Google Calendar** adds `calendar.readonly`.
-- After changing a toggle, click **Reconnect**. Each permission set has its own token file.
+- Each draft is saved to Gmail Drafts and copied to the local `drafts/` folder for download.
 
 ## Files
 
 - `app.py`: Streamlit UI
-- `gmail_agent.py`: Gmail, Calendar, summary chain, briefing and agent logic (no printing, so the UI can reuse it)
+- `gmail_agent.py`: Gmail, summary chain, briefing and agent logic (no printing, so the UI can reuse it)
 
 ## Notes
 

@@ -15,7 +15,7 @@ import gmail_agent as ga
 
 st.set_page_config(page_title="Gmail AI Agent", page_icon="📧", layout="wide")
 
-PAGES = ["📬 Summary", "🌅 Briefing", "💬 Chat", "📝 Drafts and invites"]
+PAGES = ["📬 Summary", "🌅 Briefing", "💬 Chat", "📝 Drafts"]
 
 CATEGORY_LABEL = {
     "urgent": "🔴 Urgent",
@@ -38,11 +38,12 @@ EXAMPLE_PROMPTS = [
 # --------------------------------------------------------------------------
 def init_state():
     defaults = {
-        "conn": None,  # dict: gmail, calendar, email, write_mode, calendar_enabled
+        "conn": None,  # dict: gmail, email
         "summaries": None,
         "briefing": None,
         "agent": None,
         "chat_display": [],  # [{"role", "content", "tools"}]
+        "pending_recipient_choice": None,
         "autoconnect_tried": False,
         "hosted_oauth_url": None,
         "oauth_notice": None,
@@ -67,13 +68,14 @@ def reset_outputs():
 def reset_chat():
     st.session_state.agent = None
     st.session_state.chat_display = []
+    st.session_state.pending_recipient_choice = None
 
 
-def connect(write_mode, calendar_enabled):
+def connect():
     """Sign in to Google. The first time, a browser window opens on the machine running Streamlit."""
     try:
         with st.spinner("Signing in to Google. A browser window may open..."):
-            gmail, calendar = ga.get_services(write_mode=write_mode, calendar_enabled=calendar_enabled)
+            gmail = ga.get_services()
             email = ga.get_profile_email(gmail)
     except ga.ConfigError as exc:
         st.error(str(exc))
@@ -84,10 +86,7 @@ def connect(write_mode, calendar_enabled):
 
     st.session_state.conn = {
         "gmail": gmail,
-        "calendar": calendar,
         "email": email,
-        "write_mode": write_mode,
-        "calendar_enabled": calendar_enabled,
     }
     reset_outputs()
     return True
@@ -100,9 +99,9 @@ def _oauth_request_store():
     return {"requests": {}, "lock": threading.Lock()}
 
 
-def start_hosted_oauth(write_mode, calendar_enabled):
+def start_hosted_oauth():
     state = secrets.token_urlsafe(32)
-    scopes = ga.scopes_for(write_mode, calendar_enabled)
+    scopes = ga.scopes_for()
     try:
         url, code_verifier = ga.create_hosted_oauth_url(scopes, state)
     except ga.ConfigError as exc:
@@ -119,8 +118,6 @@ def start_hosted_oauth(write_mode, calendar_enabled):
         store["requests"][state] = {
             "created": now,
             "scopes": scopes,
-            "write_mode": write_mode,
-            "calendar_enabled": calendar_enabled,
             "code_verifier": code_verifier,
         }
     st.session_state.hosted_oauth_url = url
@@ -148,16 +145,11 @@ def handle_hosted_oauth_callback():
         creds = ga.complete_hosted_oauth(
             code, state, request["scopes"], request["code_verifier"]
         )
-        gmail, calendar = ga.get_services_with_credentials(
-            creds, calendar_enabled=request["calendar_enabled"]
-        )
+        gmail = ga.get_services_with_credentials(creds)
         email = ga.get_profile_email(gmail)
         st.session_state.conn = {
             "gmail": gmail,
-            "calendar": calendar,
             "email": email,
-            "write_mode": request["write_mode"],
-            "calendar_enabled": request["calendar_enabled"],
         }
         st.session_state.oauth_notice = f"Connected as {email}."
         reset_outputs()
@@ -204,32 +196,18 @@ def render_sidebar():
                 key="user_name",
                 help="Used to sign drafts. Applies to new chats.",
             )
-            calendar_enabled = st.toggle(
-                "Read my Google Calendar",
-                value=os.getenv("ENABLE_CALENDAR", "").strip().lower() == "true",
-                key="calendar_enabled",
-                help="Read-only. Adds today's events to the briefing and lets the chat check availability.",
+            st.caption("Drafts are saved to Gmail by default. The app never sends mail.")
+            st.warning(
+                "Google has no drafts-only permission. The Gmail permission could technically send mail, "
+                "but this app has no send feature."
             )
-            write_mode = st.toggle(
-                "Save drafts to Gmail and set the Important flag",
-                value=False,
-                key="write_mode",
-            )
-            if write_mode:
-                st.warning(
-                    "Google has no drafts-only permission. This needs a scope that could technically "
-                    "send mail. The code never calls send, but the permission exists."
-                )
 
         if conn:
             st.success(f"Connected as {conn['email']}")
-            mode = "Gmail write" if conn["write_mode"] else "Read-only"
-            st.caption(f"Mode: {mode}" + (" + calendar" if conn["calendar_enabled"] else ""))
-            if (conn["write_mode"], conn["calendar_enabled"]) != (write_mode, calendar_enabled):
-                st.info("Permissions changed. Reconnect to apply them.")
+            st.caption("Mode: Gmail drafts enabled")
             left, right = st.columns(2)
             if left.button("Reconnect"):
-                if connect(write_mode, calendar_enabled):
+                if connect():
                     st.rerun()
             if right.button("Disconnect"):
                 st.session_state.conn = None
@@ -238,15 +216,16 @@ def render_sidebar():
         else:
             if st.button("Connect to Google", type="primary"):
                 if ga.hosted_oauth_enabled():
-                    start_hosted_oauth(write_mode, calendar_enabled)
-                elif connect(write_mode, calendar_enabled):
+                    start_hosted_oauth()
+                elif connect():
                     st.rerun()
             if st.session_state.hosted_oauth_url:
                 st.link_button("Continue to Google", st.session_state.hosted_oauth_url)
-            # Skip the browser step when a saved login already exists.
+            # Reuse a saved token only for local runs. Hosted sign-in must use
+            # the web OAuth redirect flow and stay within the current session.
             if not st.session_state.autoconnect_tried:
                 st.session_state.autoconnect_tried = True
-                if ga.token_exists(write_mode, calendar_enabled) and connect(write_mode, calendar_enabled):
+                if not ga.hosted_oauth_enabled() and ga.token_exists() and connect():
                     st.rerun()
     return page
 
@@ -333,9 +312,7 @@ def render_summary(conn):
 
 def render_briefing(conn):
     st.header("Morning briefing")
-    st.caption("Read-only. Checks what needs your reply, what is important, and what you are waiting on.")
-    if conn["calendar"] is None:
-        st.info("Calendar is off, so today's events are skipped. Turn on Read my Google Calendar in Settings, then reconnect.")
+    st.caption("Checks what needs your reply, what is important, and what you are waiting on.")
 
     max_results = st.slider("Emails per section", min_value=5, max_value=25, value=25, step=5)
 
@@ -343,7 +320,7 @@ def render_briefing(conn):
         try:
             llm = get_llm()
             with st.spinner("Going through your inbox..."):
-                st.session_state.briefing = ga.generate_briefing(conn["gmail"], conn["calendar"], llm, max_results)
+                st.session_state.briefing = ga.generate_briefing(conn["gmail"], llm, max_results)
         except ga.ConfigError as exc:
             st.error(str(exc))
         except Exception as exc:
@@ -354,11 +331,10 @@ def render_briefing(conn):
         return
 
     st.subheader(f"{data['generated_at']:%A, %d %B %Y}")
-    cols = st.columns(4)
+    cols = st.columns(3)
     cols[0].metric("Need your action", len(data["pending"]))
     cols[1].metric("Unread important", len(data["important"]))
     cols[2].metric("Waiting on replies", len(data["unanswered"]))
-    cols[3].metric("Events today", len(data["events"]) if data["events"] is not None else "n/a")
 
     st.subheader("Mails pending your attention")
     if not data["pending"] and not data["problems"]:
@@ -395,26 +371,70 @@ def render_briefing(conn):
             hide_index=True,
         )
 
-    st.subheader("Today's calendar")
-    if data["calendar_error"]:
-        st.warning(f"Could not read your calendar: {data['calendar_error']}")
-    elif data["events"] is None:
-        st.write("Calendar access is off.")
-    elif not data["events"]:
-        st.write("Nothing pending.")
-    else:
-        st.dataframe(
-            [{"Time": ev["time"], "Event": ev["title"], "Location": ev["location"]} for ev in data["events"]],
-            hide_index=True,
-        )
-
-
 def _queue_prompt(text):
     st.session_state.queued_prompt = text
 
 
 def _format_tool_call(name, args):
     return f"`{name}` {json.dumps(args, ensure_ascii=False)}"
+
+
+def _capture_recipient_suggestions(name, args, result):
+    if name != "find_recipient_email_suggestions" or "<untrusted_email_data>" not in result:
+        return
+    try:
+        data = result.split("<untrusted_email_data>", 1)[1].split("</untrusted_email_data>", 1)[0]
+        suggestions = json.loads(data)
+    except (IndexError, json.JSONDecodeError):
+        return
+
+    options = []
+    guess = suggestions.get("suggested_email")
+    if guess:
+        options.append({"email": guess, "label": f"UNVERIFIED suggestion: {guess}"})
+
+    gmail_matches = suggestions.get("found_in_gmail", [])
+    for match in gmail_matches:
+        address = match.get("email", "")
+        if not address or any(item["email"].casefold() == address.casefold() for item in options):
+            continue
+        display_name = match.get("display_name", "").strip()
+        label = f"Found in your Gmail: {display_name} <{address}>" if display_name else f"Found in your Gmail: {address}"
+        options.append({"email": address, "label": label})
+        # Show the guessed address and the best distinct Gmail match as the two choices.
+        if guess and len(options) >= 2:
+            break
+
+    if options:
+        st.session_state.pop("recipient_choice_select", None)
+        st.session_state.pop("recipient_choice_custom", None)
+        st.session_state.pending_recipient_choice = {
+            "name": suggestions.get("name") or args.get("name", ""),
+            "options": options,
+        }
+
+
+def _render_recipient_choice():
+    pending = st.session_state.pending_recipient_choice
+    if not pending:
+        return
+
+    options = pending["options"]
+    placeholder = "Select an email address"
+    labels = [placeholder, *(option["label"] for option in options)]
+    with st.container(border=True):
+        selected_label = st.selectbox("Recipient", labels, key="recipient_choice_select")
+        custom_email = st.text_input("Or type a different email address", key="recipient_choice_custom")
+        can_continue = bool(custom_email.strip()) or selected_label != placeholder
+        if st.button("Continue", key="recipient_choice_continue", type="primary", disabled=not can_continue):
+            selected_email = custom_email.strip() or next(
+                option["email"] for option in options if option["label"] == selected_label
+            )
+            st.session_state.pending_recipient_choice = None
+            st.session_state.queued_prompt = (
+                f"Use this recipient email address: {selected_email}. Continue drafting the email I requested."
+            )
+            st.rerun()
 
 
 def render_chat(conn):
@@ -427,6 +447,8 @@ def render_chat(conn):
 
     prompt = st.chat_input("Ask about your mail, or tell me to draft a reply")
     prompt = prompt or st.session_state.pop("queued_prompt", None)
+    if prompt and st.session_state.pending_recipient_choice:
+        st.session_state.pending_recipient_choice = None
 
     if not st.session_state.chat_display and not prompt:
         st.write("Try one of these:")
@@ -439,7 +461,10 @@ def render_chat(conn):
                 with st.expander(f"{len(msg['tools'])} tool call(s)"):
                     for line in msg["tools"]:
                         st.markdown(line)
-            st.markdown(msg["content"])
+            if msg["content"] != "[RECIPIENT_CHOICES]":
+                st.markdown(msg["content"])
+
+    _render_recipient_choice()
 
     if not prompt:
         return
@@ -462,11 +487,15 @@ def render_chat(conn):
                 st.session_state.agent = ga.build_agent(
                     conn["gmail"],
                     get_llm(),
-                    calendar=conn["calendar"],
-                    write_mode=conn["write_mode"],
                     user_name=st.session_state.user_name,
                 )
-            answer = st.session_state.agent.ask(prompt, on_tool_call=on_tool_call)
+            answer = st.session_state.agent.ask(
+                prompt,
+                on_tool_call=on_tool_call,
+                on_tool_result=_capture_recipient_suggestions,
+            )
+            if st.session_state.pending_recipient_choice:
+                answer = "[RECIPIENT_CHOICES]"
             status.update(label="Done", state="complete", expanded=False)
         except ga.ConfigError as exc:
             status.update(label="Missing setup", state="error")
@@ -474,16 +503,17 @@ def render_chat(conn):
         except Exception as exc:
             status.update(label="Something went wrong", state="error")
             answer = f"⚠️ {exc}"
-        st.markdown(answer)
+        if answer != "[RECIPIENT_CHOICES]":
+            st.markdown(answer)
 
     st.session_state.chat_display.append({"role": "assistant", "content": answer, "tools": tool_log})
+    _render_recipient_choice()
 
 
 def render_drafts():
-    st.header("Drafts and invites")
+    st.header("Drafts")
     st.caption(
-        "Everything the assistant prepares is saved here on your computer. Nothing is sent. "
-        "Open a .eml file in your mail app to edit and send it; import a .ics file into Google Calendar."
+        "Drafts are saved in Gmail and copied here for download. Nothing is sent."
     )
 
     st.subheader("Drafts")
@@ -509,22 +539,6 @@ def render_drafts():
                     mime="message/rfc822",
                     key=f"eml_{d['stem']}",
                 )
-
-    st.subheader("Calendar invites")
-    invites = ga.list_saved_invites()
-    if not invites:
-        st.write("No invite files yet. Ask the assistant in Chat to prepare a call invite.")
-    for inv in invites:
-        with st.expander(inv["name"]):
-            st.code(inv["text"], language="text")
-            st.download_button(
-                "Download .ics",
-                data=inv["path"].read_bytes(),
-                file_name=inv["name"],
-                mime="text/calendar",
-                key=f"ics_{inv['name']}",
-            )
-
 
 # --------------------------------------------------------------------------
 # Main
